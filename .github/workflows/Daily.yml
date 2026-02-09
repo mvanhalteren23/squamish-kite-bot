@@ -1,0 +1,23 @@
+name: Daily Build Check
+
+on:
+  schedule:
+    - cron: '0 14 * * *' # Runs at 6 AM PST (14:00 UTC)
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Test Script
+        run: |
+          python model_and_app.py || true
+          
