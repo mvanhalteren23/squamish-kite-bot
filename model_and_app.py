@@ -1,166 +1,191 @@
 import streamlit as st
 import pandas as pd
 import requests
-import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-# --- CONSTANTS ---
+# --- CONFIGURATION ---
 SQUAMISH_LAT = 49.7016
 SQUAMISH_LON = -123.1558
 YVR_LAT = 49.1967
 YVR_LON = -123.1815
+KITE_THRESHOLD = 15  # Knots required to kite
 
-# --- 1. DATA FETCHING (Open-Meteo Free API) ---
+# --- 1. DATA FETCHING ---
+@st.cache_data(ttl=3600) # Cache data for 1 hour to speed up mobile loading
 def get_weather_data():
-    # Fetch Squamish Data
-    url_sq = f"https://api.open-meteo.com/v1/forecast?latitude={SQUAMISH_LAT}&longitude={SQUAMISH_LON}&hourly=temperature_2m,pressure_msl,precipitation,windspeed_10m,winddirection_10m&timezone=America%2FVancouver"
+    # Fetch Squamish (Include Gusts)
+    url_sq = f"https://api.open-meteo.com/v1/forecast?latitude={SQUAMISH_LAT}&longitude={SQUAMISH_LON}&hourly=temperature_2m,pressure_msl,precipitation,windspeed_10m,winddirection_10m,windgusts_10m&timezone=America%2FVancouver"
     sq = requests.get(url_sq).json()
     
-    # Fetch YVR Data (For Pressure Gradient)
+    # Fetch YVR (For Pressure Gradient)
     url_yvr = f"https://api.open-meteo.com/v1/forecast?latitude={YVR_LAT}&longitude={YVR_LON}&hourly=pressure_msl&timezone=America%2FVancouver"
     yvr = requests.get(url_yvr).json()
 
-    # Create DataFrame
     df = pd.DataFrame({
         'time': sq['hourly']['time'],
         'temp_sq': sq['hourly']['temperature_2m'],
         'pressure_sq': sq['hourly']['pressure_msl'],
         'rain': sq['hourly']['precipitation'],
-        'wind_speed_base': sq['hourly']['windspeed_10m'],
+        'wind_base': sq['hourly']['windspeed_10m'],
+        'wind_gust_api': sq['hourly']['windgusts_10m'],
         'wind_dir': sq['hourly']['winddirection_10m'],
         'pressure_yvr': yvr['hourly']['pressure_msl']
     })
     
-    # Calculate Gradient (YVR - Squamish)
     df['gradient'] = df['pressure_yvr'] - df['pressure_sq']
     return df
 
-# --- 2. THE LOGIC (Thermal + Storm + Heat Bubble) ---
-def predict_kite_wind(row):
-    # Kiteable Hours Only (10 AM - 8 PM)
+# --- 2. PREDICTION ENGINE ---
+def calculate_wind_logic(row):
+    # Hour Filter (Night is rarely kiteable, but we calculate it anyway for 24h view)
     hour = int(row['time'].split('T')[1].split(':')[0])
-    if hour < 10 or hour > 20:
-        return 0, "Night"
-
-    # LOGIC GATES
-    # 1. Storm Safety (Rain > 2mm AND Low Pressure)
+    
+    # 1. Storm Check (Safety First)
     if row['rain'] > 2.0 and row['pressure_sq'] < 1008:
-        return 40, "DANGER: STORM"  # 40kn indicates Danger in chart
+        return 0, 0, 45, "DANGER: STORM" # 45kn gust flag
     
-    # 2. Heat Bubble (Temp > 31C kills thermal)
+    # 2. Heat Bubble (Temp > 31C)
     if row['temp_sq'] > 31.0:
-        return 5, "Heat Bubble (Lull)"
+        return 5, 8, 12, "Heat Bubble"
+
+    # 3. Thermal Calculation
+    steady = 0
+    status = "Light"
     
-    # 3. The Thermal Engine (Gradient Driven)
-    predicted_wind = 0
-    status = "No Wind"
-    
-    if row['gradient'] >= 3.5:
-        predicted_wind = 20 + (row['gradient'] - 4) * 2  # Base 20kn + bonus
-        status = "EXCELLENT"
-    elif row['gradient'] >= 2.0:
-        predicted_wind = 15 + (row['gradient'] - 2) * 2
-        status = "KITEABLE"
+    if row['gradient'] >= 4.0:
+        steady = 22 + (row['gradient'] - 4) * 2.5
+        status = "Excellent"
+    elif row['gradient'] >= 2.5:
+        steady = 16 + (row['gradient'] - 2.5) * 2
+        status = "Good"
     else:
-        predicted_wind = row['wind_speed_base'] # Fallback to synoptic wind
+        steady = row['wind_base'] # No thermal, use forecast base
         status = "Light"
 
-    # 4. Rain Penalty (Light rain kills thermal)
-    if row['rain'] > 0.5 and predicted_wind < 30: # Don't penalize storms
-        predicted_wind = predicted_wind * 0.5
-        status = "Rain Risk"
-        
-    return predicted_wind, status
+    # 4. Gusts & Lulls
+    # Squamish Factor: Gusts are usually 30-40% higher than steady thermal
+    gust = max(steady * 1.35, row['wind_gust_api'])
+    lull = steady * 0.7 # Lulls are 70% of steady
 
-# --- 3. THE APP (Streamlit UI) ---
+    # Rain Dampener
+    if row['rain'] > 0.5 and status != "Light":
+        steady *= 0.6
+        gust *= 0.8
+        status = "Rain Risk"
+
+    return lull, steady, gust, status
+
+# --- 3. UI RENDERING ---
 def main():
-    st.set_page_config(page_title="Squamish Kite Bot", page_icon="🪁")
-    st.title("🪁 Squamish Wind Predictor")
+    st.set_page_config(page_title="Squamish Wind Planner", page_icon="🪁", layout="centered")
     
-    st.write("Fetching live data from Open-Meteo...")
+    # Header
+    st.title("🪁 Squamish Wind Planner")
+    st.write(f"**Last Update:** {datetime.now().strftime('%I:%M %p')}")
+
     try:
         df = get_weather_data()
         
         # Apply Logic
-        df[['predicted_wind', 'status']] = df.apply(
-            lambda row: pd.Series(predict_kite_wind(row)), axis=1
+        df[['lull', 'steady', 'gust', 'status']] = df.apply(
+            lambda row: pd.Series(calculate_wind_logic(row)), axis=1
         )
         
-        # Convert Time
+        # Format Time
         df['datetime'] = pd.to_datetime(df['time'])
-        df['day_name'] = df['datetime'].dt.day_name()
-        df['hour_only'] = df['datetime'].dt.hour
+        now = pd.Timestamp.now()
         
-        # FILTER: Show Next 5 Days
-        today = pd.Timestamp.now().floor('D')
-        df_show = df[df['datetime'] >= today]
+        # --- SECTION 1: NEXT 24 HOURS (HOURLY) ---
+        st.divider()
+        st.subheader("⏱️ Next 24 Hours")
+        
+        # Filter: Now to Now + 24h
+        df_24h = df[(df['datetime'] >= now) & (df['datetime'] < now + timedelta(hours=24))]
+        
+        # Plotly Chart for 24h
+        fig_24 = go.Figure()
+        
+        # Gust Area (Light Red)
+        fig_24.add_trace(go.Scatter(
+            x=df_24h['datetime'], y=df_24h['gust'],
+            fill=None, mode='lines', line_color='rgba(255,0,0,0.1)', showlegend=False
+        ))
+        fig_24.add_trace(go.Scatter(
+            x=df_24h['datetime'], y=df_24h['lull'],
+            fill='tonexty', mode='lines', line_color='rgba(255,0,0,0.1)', fillcolor='rgba(255, 100, 100, 0.2)', name='Gust Range'
+        ))
+        
+        # Steady Line (Green/Red based on value)
+        fig_24.add_trace(go.Scatter(
+            x=df_24h['datetime'], y=df_24h['steady'],
+            mode='lines+markers', line=dict(color='#00CC96', width=3), name='Steady Wind'
+        ))
 
-        # --- VISUALIZATION ---
-        # Color Logic for Bar Chart
-        def get_color(wind):
-            if wind >= 35: return 'red'     # Danger
-            if wind >= 18: return '#00CC00' # Green (Good)
-            if wind >= 13: return '#FFAA00' # Yellow (Borderline)
-            return 'gray'
-            
-        df_show['color'] = df_show['predicted_wind'].apply(get_color)
+        # 15kn Threshold Line
+        fig_24.add_hline(y=15, line_dash="dash", line_color="white", annotation_text="Kiteable")
 
-        # Main Chart
-        st.subheader("7-Day Forecast (Predicted Knots)")
-        fig = px.bar(
-            df_show, x='datetime', y='predicted_wind',
-            color='predicted_wind',
-            color_continuous_scale=['gray', 'orange', 'green', 'red'],
-            range_color=[0, 35],
-            title="Wind Speed Prediction (Knots)"
+        fig_24.update_layout(
+            height=250, margin=dict(l=10, r=10, t=30, b=10),
+            yaxis_title="Knots",
+            xaxis=dict(tickformat="%I %p"), # Show 1 PM, 2 PM...
+            showlegend=False
         )
-        # Add a horizontal line for "Kiteable" threshold
-        fig.add_hline(y=15, line_dash="dash", line_color="white", annotation_text="Kiteable (15kn)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig_24, use_container_width=True)
 
-        # --- BEST TIME OF DAY ANALYSIS ---
-        st.subheader("📅 Best Time to Kite")
-        
-        # Group by Day to find Peak Wind
-        days = df_show['datetime'].dt.date.unique()
-        
-        for day in days[:5]: # Show next 5 days
-            day_data = df_show[df_show['datetime'].dt.date == day]
-            day_data = day_data[day_data['hour_only'].between(10, 20)] # Kite hours
-            
-            # Find Best Hour
-            peak_row = day_data.loc[day_data['predicted_wind'].idxmax()]
-            peak_wind = peak_row['predicted_wind']
-            peak_time = peak_row['datetime'].strftime("%I %p")
-            
-            # Logic for "Verdict"
-            verdict = "❌ No Wind"
-            icon = "💤"
-            if peak_wind >= 30: 
-                verdict = "⚠️ DANGER / STORM"
-                icon = "⛈️"
-            elif peak_wind >= 18: 
-                verdict = "✅ GO KITING"
-                icon = "🏄"
-            elif peak_wind >= 13: 
-                verdict = "⚠️ Foil / Big Kite"
-                icon = "🪂"
+        # --- SECTION 2: WEEKLY WINDOWS (START / END TIMES) ---
+        st.divider()
+        st.subheader("📅 Weekly Kite Windows")
+        st.caption("Times when wind > 15 knots.")
 
-            # Render Card
-            with st.container():
-                st.markdown(f"### {day.strftime('%A, %b %d')}")
-                col1, col2 = st.columns([1, 2])
-                with col1:
-                    st.metric(label="Peak Wind", value=f"{int(peak_wind)} kn")
-                with col2:
-                    st.write(f"**Verdict:** {icon} {verdict}")
-                    st.write(f"**Best Time:** {peak_time}")
-                    st.caption(f"Gradient: {peak_row['gradient']:.1f}mb | Temp: {peak_row['temp_sq']}°C")
-                st.divider()
+        # Filter: Next 7 Days
+        df_week = df[df['datetime'] >= now.floor('D')]
+        days = df_week['datetime'].dt.date.unique()
+
+        for day in days[:7]:
+            day_df = df_week[df_week['datetime'].dt.date == day]
+            
+            # Find Kiteable Hours (Steady > 15)
+            kite_hours = day_df[day_df['steady'] >= 15]
+            
+            day_name = day.strftime("%A, %b %d")
+            
+            if kite_hours.empty:
+                # CARD: NO WIND
+                with st.container():
+                    col1, col2 = st.columns([1, 3])
+                    col1.write(f"**{day.strftime('%a')}**")
+                    col2.markdown("💤 No Wind")
+            else:
+                # Find Start and End
+                start_time = kite_hours['datetime'].iloc[0].strftime("%I %p").lstrip("0")
+                end_time = kite_hours['datetime'].iloc[-1].strftime("%I %p").lstrip("0")
+                peak_wind = int(kite_hours['steady'].max())
+                
+                # Check for Storm Flag in this day
+                is_storm = "DANGER" in day_df['status'].values
+                
+                # CARD: WINDY
+                with st.container():
+                    col1, col2, col3 = st.columns([1, 2, 1])
+                    
+                    # Day
+                    col1.write(f"**{day.strftime('%a')}**")
+                    
+                    # Window
+                    if is_storm:
+                        col2.markdown(f"🚫 **STORM RISK**")
+                    else:
+                        col2.markdown(f"🏄 **{start_time} - {end_time}**")
+                    
+                    # Peak Strength
+                    color = "red" if peak_wind > 30 else "green"
+                    col3.markdown(f":{color}[**Max {peak_wind} kn**]")
+            
+            st.markdown("---") # Thin divider
 
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Error loading forecast: {e}")
 
 if __name__ == "__main__":
     main()
-  
